@@ -1,14 +1,16 @@
 import runpod
 from runpod.serverless.utils import rp_upload
 import os
+import shutil
 import websocket
 import base64
 import json
 import uuid
 import logging
 import urllib.request
+import urllib.error
 import urllib.parse
-import binascii # Base64 에러 처리를 위해 import
+import binascii
 
 
 # 로깅 설정
@@ -42,46 +44,55 @@ except Exception as e:
     exit(1)
 
 
-
 server_address = os.getenv('SERVER_ADDRESS', '127.0.0.1')
 client_id = str(uuid.uuid4())
-def save_data_if_base64(data_input, temp_dir, output_filename):
+
+# Pasta que o LoadImage do ComfyUI efetivamente lê
+COMFY_INPUT_DIR = "/ComfyUI/input"
+
+def save_data_if_base64(data_input, output_filename="input_image.jpg"):
     """
-    입력 데이터가 Base64 문자열인지 확인하고, 맞다면 파일로 저장 후 경로를 반환합니다.
-    만약 일반 경로 문자열이라면 그대로 반환합니다.
+    FIX: Base64 (com ou sem prefixo data URI) e salvo em /ComfyUI/input/,
+    retornando APENAS o nome do arquivo (o que o nó LoadImage espera).
+    Antes, o prefixo "data:image/...;base64," quebrava o b64decode e o
+    valor cru ia para o LoadImage -> HTTP 400 em todo request.
     """
-    # 입력값이 문자열이 아니면 그대로 반환
     if not isinstance(data_input, str):
         return data_input
 
-    try:
-        # Base64 문자열은 디코딩을 시도하면 성공합니다.
-        decoded_data = base64.b64decode(data_input)
-        
-        # 디렉토리가 존재하지 않으면 생성
-        os.makedirs(temp_dir, exist_ok=True)
-        
-        # 디코딩에 성공하면, 임시 파일로 저장합니다.
-        file_path = os.path.abspath(os.path.join(temp_dir, output_filename))
-        with open(file_path, 'wb') as f: # 바이너리 쓰기 모드('wb')로 저장
-            f.write(decoded_data)
-        
-        # 저장된 파일의 경로를 반환합니다.
-        print(f"✅ Base64 입력을 '{file_path}' 파일로 저장했습니다.")
-        return file_path
+    raw = data_input
+    if raw.startswith("data:"):
+        raw = raw.split(",", 1)[1]
 
+    try:
+        decoded_data = base64.b64decode(raw)
+        os.makedirs(COMFY_INPUT_DIR, exist_ok=True)
+        file_path = os.path.join(COMFY_INPUT_DIR, output_filename)
+        with open(file_path, 'wb') as f:
+            f.write(decoded_data)
+        print(f"✅ Base64 salvo em '{file_path}'")
+        return output_filename
     except (binascii.Error, ValueError):
-        # 디코딩에 실패하면, 일반 경로로 간주하고 원래 값을 그대로 반환합니다.
-        print(f"➡️ '{data_input}'은(는) 파일 경로로 처리합니다.")
+        print(f"➡️ '{data_input[:60]}...' tratado como caminho/URL")
         return data_input
-    
+
 def queue_prompt(prompt):
     url = f"http://{server_address}:8188/prompt"
     logger.info(f"Queueing prompt to: {url}")
     p = {"prompt": prompt, "client_id": client_id}
     data = json.dumps(p).encode('utf-8')
-    req = urllib.request.Request(url, data=data)
-    return json.loads(urllib.request.urlopen(req).read())
+    # FIX: Content-Type correto + log do body do 400 (diagnóstico)
+    req = urllib.request.Request(
+        url, data=data,
+        headers={"Content-Type": "application/json"}
+    )
+    try:
+        return json.loads(urllib.request.urlopen(req).read())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", "ignore")
+        print("ComfyUI /prompt HTTPError:", e.code, e.reason)
+        print("ComfyUI /prompt body:", body)
+        raise
 
 def get_image(filename, subfolder, folder_type):
     url = f"http://{server_address}:8188/view"
@@ -118,7 +129,6 @@ def get_images(ws, prompt):
         if 'images' in node_output:
             for image in node_output['images']:
                 image_data = get_image(image['filename'], image['subfolder'], image['type'])
-                # bytes 객체를 base64로 인코딩하여 JSON 직렬화 가능하게 변환
                 if isinstance(image_data, bytes):
                     import base64
                     image_data = base64.b64encode(image_data).decode('utf-8')
@@ -138,13 +148,23 @@ def handler(job):
     task_id = f"task_{uuid.uuid4()}"
 
     image_input = job_input["image_path"]
-    # 헬퍼 함수를 사용해 이미지 파일 경로 확보 (Base64 또는 Path)
-    # 이미지 확장자를 알 수 없으므로 .jpg로 가정하거나, 입력에서 받아야 합니다.
+
+    # FIX: suporta os 4 formatos de image_path
     if image_input == "/example_image.png":
-        image_path = "/example_image.png"
+        os.makedirs(COMFY_INPUT_DIR, exist_ok=True)
+        src = "/example_image.png"
+        dst = os.path.join(COMFY_INPUT_DIR, "example_image.png")
+        if os.path.exists(src) and not os.path.exists(dst):
+            shutil.copy(src, dst)
+        image_path = "example_image.png"
+    elif image_input.startswith("http://") or image_input.startswith("https://"):
+        os.makedirs(COMFY_INPUT_DIR, exist_ok=True)
+        urllib.request.urlretrieve(
+            image_input, os.path.join(COMFY_INPUT_DIR, "input_image.jpg")
+        )
+        image_path = "input_image.jpg"
     else:
-        image_path = save_data_if_base64(image_input, task_id, "input_image.jpg")
-    
+        image_path = save_data_if_base64(image_input)
 
     prompt = load_workflow("/flux_kontext_example.json")
 
@@ -159,12 +179,10 @@ def handler(job):
 
     ws_url = f"ws://{server_address}:8188/ws?clientId={client_id}"
     logger.info(f"Connecting to WebSocket: {ws_url}")
-    
-    # 먼저 HTTP 연결이 가능한지 확인
+
     http_url = f"http://{server_address}:8188/"
     logger.info(f"Checking HTTP connection to: {http_url}")
-    
-    # HTTP 연결 확인 (최대 1분)
+
     max_http_attempts = 180
     for http_attempt in range(max_http_attempts):
         try:
@@ -177,10 +195,9 @@ def handler(job):
             if http_attempt == max_http_attempts - 1:
                 raise Exception("ComfyUI 서버에 연결할 수 없습니다. 서버가 실행 중인지 확인하세요.")
             time.sleep(1)
-    
+
     ws = websocket.WebSocket()
-    # 웹소켓 연결 시도 (최대 3분)
-    max_attempts = int(180/5)  # 3분 (1초에 한 번씩 시도)
+    max_attempts = int(180/5)
     for attempt in range(max_attempts):
         import time
         try:
@@ -195,15 +212,13 @@ def handler(job):
     images = get_images(ws, prompt)
     ws.close()
 
-    # 이미지가 없는 경우 처리
     if not images:
         return {"error": "이미지를 생성할 수 없습니다."}
-    
-    # 첫 번째 이미지 반환
+
     for node_id in images:
         if images[node_id]:
             return {"image": images[node_id][0]}
-    
+
     return {"error": "이미지를 찾을 수 없습니다."}
 
 runpod.serverless.start({"handler": handler})
